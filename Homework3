@@ -1,0 +1,433 @@
+### Bloom Filter
+
+Comments by user id
+
+package npu11117.wordcount;
+
+import java.io.DataInputStream;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.net.URI;
+import java.util.Map;
+
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.conf.Configured;
+import org.apache.hadoop.filecache.DistributedCache;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.NullWritable;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.mapreduce.Job;
+import org.apache.hadoop.mapreduce.Mapper;
+import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
+import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+import org.apache.hadoop.util.GenericOptionsParser;
+import org.apache.hadoop.util.Tool;
+import org.apache.hadoop.util.ToolRunner;
+import org.apache.hadoop.util.bloom.Key;
+
+
+public class BloomFilterCommentsByUserId extends Configured implements Tool {
+  public static class BloomFilterMapper extends Mapper<Object, Text, Text, NullWritable> {
+    private org.apache.hadoop.util.bloom.BloomFilter filter = new org.apache.hadoop.util.bloom.BloomFilter();
+
+    @Override
+    public void setup(Context context) throws IOException, InterruptedException {
+      Path[] files = DistributedCache.getLocalCacheFiles(context.getConfiguration());
+      System.out.println("Reading Bloom filter from: " + files[0]);
+
+      DataInputStream stream = new DataInputStream(new FileInputStream(files[0].toString()));
+      filter.readFields(stream);
+      stream.close();
+    }
+
+    @Override
+    public void map(Object key, Text value, Context context) throws IOException, InterruptedException {
+      Map<String,String> parsed = MRDPUtils.transformXmlToMap(value.toString());
+
+      String body = parsed.get("Text");
+      if (MRDPUtils.isNullOrEmpty(body)) {
+        return;
+      }
+      String userId = parsed.get("UserId");
+      if (MRDPUtils.isNullOrEmpty(userId) || !MRDPUtils.isInteger(userId)) {
+        return;
+      }
+
+      // even though the map/reduce job which creates the input for the bloom filter uses IntWritable its still
+      // just text on disk - and the bloom filter was created using those string values (inefficient as it may be)
+      // so we just use the string values here - for optimization the bloom filter should be changed to use the
+      // bytes of the integer value
+      if (filter.membershipTest(new Key(userId.getBytes()))) {
+        context.write(value, NullWritable.get());
+      }
+
+    }
+  }
+
+  public static void main(String[] args) throws Exception {
+    int res = ToolRunner.run(new Configuration(), new BloomFilterCommentsByUserId(), args);
+    System.exit(res);
+  }
+
+  @Override
+  public int run(String[] args) throws Exception {
+    Configuration conf = new Configuration();
+    GenericOptionsParser parser = new GenericOptionsParser(conf, args);
+    String[] otherArgs = parser.getRemainingArgs();
+    if (otherArgs.length != 3) {
+      System.err.println("Usage: BloomFilterCommentsByUserId <bloom_filter_file> <in> <out>");
+      ToolRunner.printGenericCommandUsage(System.err);
+      System.exit(2);
+    }
+
+    DistributedCache.addCacheFile(new URI(otherArgs[0]), conf);
+    Job job = new Job(conf, "Bloom Filter Comments by User ID");
+    job.setJarByClass(BloomFilterCommentsByUserId.class);
+    job.setMapperClass(BloomFilterMapper.class);
+    job.setOutputKeyClass(Text.class);
+    job.setOutputValueClass(NullWritable.class);
+    FileInputFormat.addInputPath(job, new Path(otherArgs[1]));
+    FileOutputFormat.setOutputPath(job, new Path(otherArgs[2]));
+    boolean success = job.waitForCompletion(true);
+
+    return success ? 0 : 1;
+  }
+}
+
+
+
+
+Driver
+
+
+package npu11117.wordcount;
+
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.util.zip.GZIPInputStream;
+
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FSDataOutputStream;
+import org.apache.hadoop.fs.FileStatus;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.util.GenericOptionsParser;
+import org.apache.hadoop.util.bloom.BloomFilter;
+import org.apache.hadoop.util.bloom.Key;
+import org.apache.hadoop.util.hash.Hash;
+
+public class BloomFilterDriver {
+
+	public static void main(String[] args) throws Exception {
+		Configuration conf = new Configuration();
+		String[] otherArgs = new GenericOptionsParser(conf, args)
+				.getRemainingArgs();
+		if (otherArgs.length != 4) {
+			System.err
+					.println("Usage: BloomFilterWriter <inputfile> <nummembers> <falseposrate> <bfoutfile>");
+			System.exit(1);
+		}
+
+		FileSystem fs = FileSystem.get(new Configuration());
+
+		// Parse command line arguments
+		Path inputFile = new Path(otherArgs[0]);
+		int numMembers = Integer.parseInt(otherArgs[1]);
+		float falsePosRate = Float.parseFloat(otherArgs[2]);
+		Path bfFile = new Path(otherArgs[3]);
+
+		// Calculate our vector size and optimal K value based on approximations
+		int vectorSize = getOptimalBloomFilterSize(numMembers, falsePosRate);
+		int nbHash = getOptimalK(numMembers, vectorSize);
+
+		// create new Bloom filter
+		BloomFilter filter = new BloomFilter(vectorSize, nbHash,
+				Hash.MURMUR_HASH);
+
+		// Open file for read
+
+		System.out.println("Training Bloom filter of size " + vectorSize
+				+ " with " + nbHash + " hash functions, " + numMembers
+				+ " approximate number of records, and " + falsePosRate
+				+ " false positive rate");
+
+		String line = null;
+		int numRecords = 0;
+		for (FileStatus status : fs.listStatus(inputFile)) {
+			BufferedReader rdr;
+			// if file is gzipped, wrap it in a GZIPInputStream
+			if (status.getPath().getName().endsWith(".gz")) {
+				rdr = new BufferedReader(new InputStreamReader(
+						new GZIPInputStream(fs.open(status.getPath()))));
+			} else {
+				rdr = new BufferedReader(new InputStreamReader(fs.open(status
+						.getPath())));
+			}
+
+			System.out.println("Reading " + status.getPath());
+			while ((line = rdr.readLine()) != null) {
+				filter.add(new Key(line.getBytes()));
+				++numRecords;
+			}
+
+			rdr.close();
+		}
+
+		System.out.println("Trained Bloom filter with " + numRecords
+				+ " entries.");
+
+		System.out.println("Serializing Bloom filter to HDFS at " + bfFile);
+		FSDataOutputStream strm = fs.create(bfFile);
+		filter.write(strm);
+
+		strm.flush();
+		strm.close();
+
+		System.out.println("Done training Bloom filter.");
+	}
+
+	public static int getOptimalBloomFilterSize(int numRecords,
+			float falsePosRate) {
+		int size = (int) (-numRecords * (float) Math.log(falsePosRate) / Math
+				.pow(Math.log(2), 2));
+		return size;
+	}
+
+	public static int getOptimalK(float numMembers, float vectorSize) {
+		return (int) Math.round(vectorSize / numMembers * Math.log(2));
+	}
+}
+
+
+
+MRDP Utils
+
+
+package npu11117.wordcount;
+
+import java.util.HashMap;
+import java.util.Map;
+import java.text.SimpleDateFormat;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import org.apache.commons.lang.StringEscapeUtils;
+
+public class MRDPUtils {
+  private static final Pattern INTEGER = Pattern.compile("\\d+");
+
+  public static Map<String, String> transformXmlToMap(String xml) {
+    Map<String,String> map = new HashMap<String,String>();
+    try {
+      String[] tokens = xml.trim().substring(5, xml.trim().length() - 3).split("\"");
+      for (int i = 0; i < tokens.length; i += 2) {
+        String key = tokens[i].trim();
+        String val;
+        if (i + 1 >= tokens.length) {
+          val = null;
+        } else {
+          val = StringEscapeUtils.unescapeHtml(tokens[i+1].trim());
+        }
+
+        map.put(key.substring(0, key.length() - 1), val);
+      }
+    } catch (StringIndexOutOfBoundsException e) {
+      System.err.println(xml);
+    }
+
+    return map;
+  }
+
+  public final static SimpleDateFormat DATE_FORMAT = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.sss");
+
+  public static boolean isNullOrEmpty(String str) {
+    return str == null || str.length() == 0;
+  }
+
+  public static boolean isInteger(String str) {
+    Matcher is = INTEGER.matcher(str);
+    return is.matches();
+  }
+
+}
+
+
+Mutual Friends list
+
+
+package npu11117.wordcount;
+import java.io.IOException;
+import java.util.*;
+
+import npu11117.wordcount.WordCount.Map;
+import npu11117.wordcount.WordCount.Reduce;
+
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.IntWritable;
+import org.apache.hadoop.io.LongWritable;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.mapreduce.Job;
+import org.apache.hadoop.mapreduce.Mapper;
+import org.apache.hadoop.mapreduce.Reducer;
+import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
+import org.apache.hadoop.mapreduce.lib.input.TextInputFormat;
+import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+import org.apache.hadoop.mapreduce.lib.output.TextOutputFormat;
+
+public class MutualFriendList {
+   
+   public static class Map extends Mapper<LongWritable , Text, Text, IntWritable> {
+       public final static IntWritable ONE = new IntWritable(1);
+
+      @Override
+      public void map(LongWritable  key, Text value, Context context)
+              throws IOException, InterruptedException{
+          ArrayList <String> friendList = new ArrayList<String>();
+          if (!key.toString().isEmpty()){
+         for (String token: value.toString().split("\\s|,") )
+        		 {
+             friendList.add(token);
+           }
+        
+         for (int i=0; i<friendList.size();i++){
+             for (int j=0;j<friendList.size();j++){
+                 if (i!=j){
+                     context.write(new Text(friendList.get(i) + "," + friendList.get(j)), ONE);
+                 }
+             }
+         }
+          }
+      }
+   }
+ 
+   public static class Reduce extends Reducer<Text, IntWritable, Text, IntWritable> {
+      public void reduce(Text key, Iterable<IntWritable> value, Context context)
+              throws IOException, InterruptedException {
+         int sum = 0;
+         for (IntWritable val : value) {
+                
+             sum += 1;
+            
+         }
+         if (sum!=0){
+         context.write(key, new IntWritable(sum));
+         }
+   }
+    
+
+   }
+
+   
+   public static void main(String[] args) throws Exception
+	{
+		Configuration conf = new Configuration();
+
+		Job job = new Job(conf, "MutualFriendList");
+		job.setJarByClass(MutualFriendList.class);
+		job.setOutputKeyClass(Text.class);
+		job.setOutputValueClass(IntWritable.class);
+
+		job.setMapperClass(Map.class);
+		job.setReducerClass(Reduce.class);
+
+		job.setInputFormatClass(TextInputFormat.class);
+		job.setOutputFormatClass(TextOutputFormat.class);
+
+		FileInputFormat.addInputPath(job, new Path(args[0]));
+		FileOutputFormat.setOutputPath(job, new Path(args[1]));
+
+		job.waitForCompletion(true);
+	}
+  
+       }
+       
+       
+       
+       
+ Used Id by reputation
+ 
+ package npu11117.wordcount;
+
+
+import java.io.IOException;
+import java.util.Map;
+
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.conf.Configured;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.io.IntWritable;
+import org.apache.hadoop.io.NullWritable;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.mapreduce.Job;
+import org.apache.hadoop.mapreduce.Mapper;
+import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
+import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+import org.apache.hadoop.util.GenericOptionsParser;
+import org.apache.hadoop.util.Tool;
+import org.apache.hadoop.util.ToolRunner;
+
+public class UserIdsByReputation extends Configured implements Tool {
+  public static final String REPUTATION_KEY = "minimum_reputation";
+
+  public static class UserIdsByReputationMapper extends Mapper<Object, Text, IntWritable, NullWritable> {
+    private int minimumReputation = 0;
+
+    @Override
+    public void setup(Context context) throws IOException, InterruptedException {
+      minimumReputation = context.getConfiguration().getInt(REPUTATION_KEY, 0);
+    }
+
+    @Override
+    public void map(Object key, Text value, Context context) throws IOException, InterruptedException {
+      Map<String,String> parsed = MRDPUtils.transformXmlToMap(value.toString());
+
+      String reputation = parsed.get("Reputation");
+      if (MRDPUtils.isNullOrEmpty(reputation) || !MRDPUtils.isInteger(reputation)) {
+        return;
+      }
+      String userId = parsed.get("Id");
+      if (MRDPUtils.isNullOrEmpty(userId) || !MRDPUtils.isInteger(userId)) {
+        return;
+      }
+
+      if (Integer.parseInt(reputation) < minimumReputation) {
+        return;
+      }
+
+      context.write(new IntWritable(Integer.parseInt(userId)), NullWritable.get());
+    }
+  }
+
+  public static void main(String[] args) throws Exception {
+    int res = ToolRunner.run(new Configuration(), new UserIdsByReputation(), args);
+    System.exit(res);
+  }
+
+  @Override
+  public int run(String[] args) throws Exception {
+    Configuration conf = new Configuration();
+    GenericOptionsParser parser = new GenericOptionsParser(conf, args);
+    String[] otherArgs = parser.getRemainingArgs();
+    if (otherArgs.length != 3) {
+      System.err.println("Usage: UserIdsByReputation <minimum_reputation> <in> <out>");
+      ToolRunner.printGenericCommandUsage(System.err);
+      System.exit(2);
+    }
+    Job job = new Job(conf, "User IDs by Reputation");
+    job.setJarByClass(UserIdsByReputation.class);
+    job.setMapperClass(UserIdsByReputationMapper.class);
+    job.setOutputKeyClass(IntWritable.class);
+    job.setOutputValueClass(NullWritable.class);
+    job.setNumReduceTasks(1);
+    job.getConfiguration().setInt(REPUTATION_KEY, Integer.parseInt(otherArgs[0]));
+    FileInputFormat.addInputPath(job, new Path(otherArgs[1]));
+    FileOutputFormat.setOutputPath(job, new Path(otherArgs[2]));
+    boolean success = job.waitForCompletion(true);
+
+    return success ? 0 : 1;
+  }
+}
+
